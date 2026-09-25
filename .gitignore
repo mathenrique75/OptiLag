@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.db
+optilag_auth.json
+optilag_config.json
+optilag_history.json
+conf/*.conf
+!conf/*.example
+build/
+dist/
+*.zip
+.pytest_cache/
+.mypy_cache/

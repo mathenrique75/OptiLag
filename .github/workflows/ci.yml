@@ -1,0 +1,52 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Syntax check (backend)
+        run: python -m compileall -q optilag_backend
+      - name: Backend CLI test
+        run: python -m optilag_backend.cli_test
+      - name: Pydantic demo
+        run: python -m optilag_backend.learn_pydantic
+      - name: Import API app
+        run: python -c "from optilag_backend.api import app; print('API', app.title, app.version)"
+
+  ui-syntax:
+    name: UI syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install minimal UI deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install customtkinter pillow
+      - name: Compile UI
+        run: |
+          python -m py_compile optilag_pubg.py
+          echo "optilag_pubg.py OK"
