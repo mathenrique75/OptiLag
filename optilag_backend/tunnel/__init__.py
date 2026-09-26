@@ -1,2 +1,2 @@
-﻿from .wireguard import WireGuardTunnel, TunnelStatus
-__all__ = ["WireGuardTunnel", "TunnelStatus"]
+﻿from .wireguard import WireGuardTunnel, TunnelStatus, TunnelInfo
+__all__ = ["WireGuardTunnel", "TunnelStatus", "TunnelInfo"]
