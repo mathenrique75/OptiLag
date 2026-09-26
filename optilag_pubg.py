@@ -16,6 +16,12 @@ import urllib.request
 import subprocess
 import re
 import hashlib
+try:
+    import pyotp
+    HAS_PYOTP = True
+except ImportError:
+    HAS_PYOTP = False
+    pyotp = None
 import secrets
 import string
 from datetime import datetime
@@ -31,6 +37,14 @@ try:
     HAS_BACKEND = True
 except Exception as _be:
     HAS_BACKEND = False
+
+try:
+    from optilag_backend.tunnel.wireguard import WireGuardTunnel, TunnelStatus
+    HAS_WG = True
+except Exception as _wg:
+    HAS_WG = False
+    print(f"[wireguard] offline: {_wg}")
+
     print(f"[backend] offline: {_be}")
 
 try:
@@ -193,8 +207,44 @@ COR_CARD2 = "#12121c"
 COR_VERMELHO = "#ff0055"
 COR_LARANJA = "#ffb800"
 COR_TEXTO = "#e8f6ff"
-COR_SEC = "#6b7c8a"
+COR_SEC = "#8b9bab"  # WCAG AA on cards (~5:1+)
 COR_BORDA = "#1e3a4c"
+
+# --- A11y: focus ring (WCAG 2.2 focus visible) ---
+FOCUS_RING = "#00f0ff"
+FOCUS_BORDER_NORMAL = COR_BORDA
+
+
+def attach_focus_ring(widget, normal_border=None):
+    """Contorno visível com foco de teclado (FocusIn/FocusOut)."""
+    if normal_border is None:
+        normal_border = FOCUS_BORDER_NORMAL
+
+    def on_in(_event=None):
+        try:
+            widget.configure(border_width=2, border_color=FOCUS_RING)
+        except Exception:
+            pass
+
+    def on_out(_event=None):
+        try:
+            widget.configure(border_width=1, border_color=normal_border)
+        except Exception:
+            pass
+
+    try:
+        widget.bind("<FocusIn>", on_in)
+        widget.bind("<FocusOut>", on_out)
+    except Exception:
+        pass
+
+
+def attach_focus_many(*widgets, normal_border=None):
+    for w in widgets:
+        if w is not None:
+            attach_focus_ring(w, normal_border=normal_border)
+
+
 COR_GLOW = "#00f0ff"
 # Sondas UDP (DNS) + fallback ICMP
 UDP_DNS_TARGETS = [
@@ -436,6 +486,8 @@ def default_config():
         "som": True, "competitivo": False, "compacto": False, "grafico": False,
         "always_on_top": False, "jogo": "PUBG: Battlegrounds", "rota": "Madrid → São Paulo",
         "perfis": {}, "favoritos": ["Madrid → São Paulo"], "tempo_total_seg": 0,
+        "xp": 0, "level": 1, "sessoes_count": 0,
+        "conquistas": [],
 
     }
 
@@ -500,7 +552,7 @@ class AuthManager:
         self.save()
         return key
 
-    def login(self, username: str, password: str) -> tuple:
+    def login(self, username: str, password: str, totp_code: str = None) -> tuple:
         user = self.data["users"].get(username)
         if not user:
             return False, "invalid"
@@ -513,12 +565,71 @@ class AuthManager:
             lic = user.get("license")
             if not lic or lic not in self.data["licenses"] or not self.data["licenses"][lic].get("active"):
                 return False, "need_license"
+        # 2FA TOTP
+        if user.get("totp_enabled") and user.get("totp_secret"):
+            if not HAS_PYOTP:
+                return False, "need_2fa_module"
+            code = (totp_code or "").strip().replace(" ", "")
+            if not code:
+                return False, "need_2fa"
+            if not self.verify_totp(username, code):
+                return False, "invalid_2fa"
         # Atualiza último acesso
         user["last_login"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         if "created_at" not in user:
             user["created_at"] = user.get("last_login", "—")
         self.save()
         return True, user.get("role", "user")
+
+    def verify_totp(self, username: str, code: str) -> bool:
+        if not HAS_PYOTP:
+            return False
+        user = self.data["users"].get(username) or {}
+        secret = user.get("totp_secret")
+        if not secret:
+            return False
+        try:
+            totp = pyotp.TOTP(secret)
+            return bool(totp.verify(code.strip(), valid_window=1))
+        except Exception:
+            return False
+
+    def setup_2fa(self, username: str) -> tuple:
+        """Gera secret TOTP. Retorna (ok, secret_ou_erro, otpauth_uri)."""
+        if not HAS_PYOTP:
+            return False, "Instala: pip install pyotp", ""
+        user = self.data["users"].get(username)
+        if not user:
+            return False, "Utilizador inexistente", ""
+        secret = pyotp.random_base32()
+        user["totp_secret"] = secret
+        user["totp_enabled"] = False  # só após confirmar código
+        self.save()
+        uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name="OptiLag")
+        return True, secret, uri
+
+    def confirm_2fa(self, username: str, code: str) -> bool:
+        if not self.verify_totp(username, code):
+            return False
+        user = self.data["users"].get(username)
+        if not user:
+            return False
+        user["totp_enabled"] = True
+        self.save()
+        return True
+
+    def disable_2fa(self, username: str, password: str) -> bool:
+        user = self.data["users"].get(username)
+        if not user or user.get("password") != hash_pw(password):
+            return False
+        user["totp_enabled"] = False
+        user["totp_secret"] = None
+        self.save()
+        return True
+
+    def has_2fa(self, username: str) -> bool:
+        user = self.data["users"].get(username) or {}
+        return bool(user.get("totp_enabled") and user.get("totp_secret"))
 
     def set_session(self, username: str, remember: bool):
         self.data["session"] = {"user": username if remember else None, "remember": remember}
@@ -648,6 +759,11 @@ class SetupWindow(ctk.CTk):
         ctk.CTkButton(self, text="Criar conta Admin", width=320, height=40, fg_color="#00f0ff",
                       hover_color="#00c4d6", text_color="#0d1117", command=self._create).pack(pady=10)
 
+        attach_focus_many(self.e1, self.e2)
+        for _w in self.winfo_children():
+            if isinstance(_w, ctk.CTkButton):
+                attach_focus_ring(_w, normal_border="#21262d")
+
     def _create(self):
         p1, p2 = self.e1.get(), self.e2.get()
         if len(p1) < 4:
@@ -684,6 +800,10 @@ class LoginWindow(ctk.CTk):
         self.e_pass = ctk.CTkEntry(self, show="•", width=320, height=36, fg_color="#21262d", border_color=COR_BORDA)
         self.e_pass.pack(pady=4)
 
+        ctk.CTkLabel(self, text="Código 2FA (se ativo)", font=ctk.CTkFont(size=12), text_color=COR_SEC).pack(anchor="w", padx=50, pady=(8, 0))
+        self.e_totp = ctk.CTkEntry(self, width=320, height=36, fg_color="#21262d", border_color=COR_BORDA, placeholder_text="000000")
+        self.e_totp.pack(pady=4)
+
         self.remember = ctk.CTkCheckBox(self, text="Lembrar sessão", text_color=COR_SEC, fg_color="#00f0ff")
         self.remember.pack(pady=10)
 
@@ -693,6 +813,12 @@ class LoginWindow(ctk.CTk):
         ctk.CTkButton(self, text="Entrar", width=320, height=40, fg_color="#00f0ff",
                       hover_color="#00c4d6", text_color="#0d1117", command=self._login).pack(pady=8)
 
+        attach_focus_many(self.e_user, self.e_pass, getattr(self, "e_totp", None), normal_border=COR_BORDA)
+        # Foco nos botões da janela de login
+        for _w in self.winfo_children():
+            if isinstance(_w, ctk.CTkButton):
+                attach_focus_ring(_w, normal_border="#21262d")
+
         ctk.CTkButton(self, text="Ativar licença", width=320, height=32, fg_color="#21262d",
                       hover_color="#30363d", command=self._activate_ui).pack()
 
@@ -700,12 +826,20 @@ class LoginWindow(ctk.CTk):
 
     def _login(self):
         u, p = self.e_user.get().strip(), self.e_pass.get()
-        ok, info = self.auth.login(u, p)
+        code = self.e_totp.get().strip() if hasattr(self, "e_totp") else ""
+        ok, info = self.auth.login(u, p, totp_code=code or None)
         if not ok:
-            msgs = {"invalid": "Utilizador ou palavra-passe incorretos",
-                    "need_license": "Conta sem licença válida. Ativa uma chave.",
-                    "inactive": "Conta desativada"}
+            msgs = {
+                "invalid": "Utilizador ou palavra-passe incorretos",
+                "need_license": "Conta sem licença válida. Ativa uma chave.",
+                "inactive": "Conta desativada",
+                "need_2fa": "Introduz o código 2FA da app autenticadora",
+                "invalid_2fa": "Código 2FA inválido ou expirado",
+                "need_2fa_module": "Instala pyotp: pip install pyotp",
+            }
             self.msg.configure(text=msgs.get(info, "Erro"))
+            if info in ("need_2fa", "invalid_2fa") and hasattr(self, "e_totp"):
+                self.e_totp.focus_set()
             return
         self.auth.set_session(u, self.remember.get() == 1)
         self.result_user = u
@@ -900,6 +1034,7 @@ class OptiLagApp(ctk.CTk):
         self.combo_rota = ctk.CTkComboBox(self.card_route, values=list(ROTAS.keys()), width=500, height=30,
                                           fg_color="#21262d", border_color=COR_BORDA, button_color=self.accent, command=self._on_route)
         self.combo_rota.set(self.rota)
+        attach_focus_ring(self.combo_rota)
         self.combo_rota.pack(padx=10, pady=(0, 4))
 
         # Mapa visual da rota (nós)
@@ -989,6 +1124,45 @@ class OptiLagApp(ctk.CTk):
         self.lbl_alert.pack()
 
 
+        # --- Ações rápidas ---
+        act = ctk.CTkFrame(self.main, fg_color="transparent")
+        act.pack(fill="x", pady=(4, 4))
+        ctk.CTkButton(act, text="🎯 Melhor rota", width=150, height=30, fg_color="#21262d",
+                      hover_color="#30363d", command=self._best_route).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(act, text="📤 Exportar sessão", width=150, height=30, fg_color="#21262d",
+                      hover_color="#30363d", command=self._export_session).pack(side="left")
+        self.btn_wg = ctk.CTkButton(act, text="🔐 Tunnel WG", width=130, height=30, fg_color="#21262d",
+                      hover_color="#30363d", command=self._toggle_tunnel)
+        self.btn_wg.pack(side="left", padx=(6, 0))
+        attach_focus_ring(self.btn_opt)
+        attach_focus_ring(self.btn_wg, normal_border="#21262d")
+        if hasattr(self, "btn_fav"):
+            attach_focus_ring(self.btn_fav, normal_border="#21262d")
+        for _w in getattr(self, "main", self).winfo_children():
+            pass  # entries/combos abaixo
+
+        self.lbl_wg = ctk.CTkLabel(self.main, text="WireGuard: —", font=ctk.CTkFont(size=11), text_color=COR_SEC)
+        self.lbl_wg.pack(anchor="w", pady=(0, 4))
+        self._wg = None
+        if HAS_WG:
+            try:
+                self._wg = WireGuardTunnel()
+                self.after(800, self._refresh_tunnel_ui)
+            except Exception as e:
+                print(f"[wg] {e}")
+
+        # --- XP / Conquistas ---
+        self.card_xp = self._card()
+        ctk.CTkLabel(self.card_xp, text="PROGRESSO", font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=COR_SEC).pack(anchor="w", padx=10, pady=(8, 2))
+        self.lbl_xp = ctk.CTkLabel(self.card_xp, text="", font=ctk.CTkFont(size=12), text_color=COR_TEXTO)
+        self.lbl_xp.pack(anchor="w", padx=10, pady=1)
+        self.xp_bar = ctk.CTkProgressBar(self.card_xp, height=8, progress_color=self.accent)
+        self.xp_bar.pack(fill="x", padx=10, pady=4)
+        self.lbl_ach = ctk.CTkLabel(self.card_xp, text="", font=ctk.CTkFont(size=11),
+                                    text_color=COR_SEC, wraplength=480, justify="left")
+        self.lbl_ach.pack(anchor="w", padx=10, pady=(0, 8))
+        self._refresh_xp_ui()
 
         # --- Painel Backend / API ---
         self.card_backend = self._card()
@@ -1317,6 +1491,180 @@ class OptiLagApp(ctk.CTk):
         except Exception as e:
             print(f"[backend panel] {e}")
 
+
+    def _xp_for_level(self, level: int) -> int:
+        return 100 + (level - 1) * 50
+
+    def _refresh_xp_ui(self):
+        try:
+            xp = int(self.cfg.get("xp", 0))
+            level = int(self.cfg.get("level", 1))
+            need = self._xp_for_level(level)
+            self.lbl_xp.configure(text=f"Nível {level}  ·  {xp}/{need} XP  ·  {self.cfg.get('sessoes_count', 0)} sessões")
+            self.xp_bar.set(min(1.0, xp / max(need, 1)))
+            ach = self.cfg.get("conquistas") or []
+            if ach:
+                self.lbl_ach.configure(text="Conquistas: " + " · ".join(ach[-5:]))
+            else:
+                self.lbl_ach.configure(text="Conquistas: nenhuma ainda — otimiza para desbloquear")
+        except Exception as e:
+            print(f"[xp ui] {e}")
+
+    def _add_xp(self, amount: int, reason: str = ""):
+        xp = int(self.cfg.get("xp", 0)) + amount
+        level = int(self.cfg.get("level", 1))
+        while xp >= self._xp_for_level(level):
+            xp -= self._xp_for_level(level)
+            level += 1
+            self._unlock_ach(f"Nível {level}")
+        self.cfg["xp"] = xp
+        self.cfg["level"] = level
+        self._save_cfg()
+        self._refresh_xp_ui()
+        if reason:
+            try:
+                self.lbl_info.configure(text=f"+{amount} XP — {reason}")
+            except Exception:
+                pass
+
+    def _unlock_ach(self, name: str):
+        ach = list(self.cfg.get("conquistas") or [])
+        if name not in ach:
+            ach.append(name)
+            self.cfg["conquistas"] = ach
+            self._save_cfg()
+            try:
+                self.lbl_info.configure(text=f"🏆 Conquista: {name}")
+            except Exception:
+                pass
+
+    def _check_session_achievements(self, dur: int, gain: int):
+        n = int(self.cfg.get("sessoes_count", 0))
+        if n >= 1:
+            self._unlock_ach("Primeira sessão")
+        if n >= 10:
+            self._unlock_ach("Veterano (10 sessões)")
+        if dur >= 600:
+            self._unlock_ach("Maratona 10 min")
+        if gain >= 40:
+            self._unlock_ach("Grande melhoria (+40ms)")
+        total = int(self.cfg.get("tempo_total_seg", 0))
+        if total >= 3600:
+            self._unlock_ach("1h otimizada")
+
+    def _best_route(self):
+        """Escolhe a melhor rota overlay (Dijkstra / backend)."""
+        try:
+            if HAS_BACKEND:
+                choice = backend_router.best_overlay()
+                name = choice.name
+                self.lbl_info.configure(
+                    text=f"Melhor rota: {name} (~{choice.overlay_ping_est} ms, -{choice.gain_ms} ms)"
+                )
+            else:
+                # fallback: menor base nas ROTAS
+                name = min(ROTAS.keys(), key=lambda k: ROTAS[k].get("base", 999))
+                self.lbl_info.configure(text=f"Melhor rota: {name}")
+            self.combo_rota.set(name)
+            self._on_route(name)
+            self._add_xp(5, "explorou melhor rota")
+        except Exception as e:
+            self.lbl_info.configure(text=f"Erro melhor rota: {e}")
+
+    def _export_session(self):
+        """Exporta relatório da última sessão / estado atual para TXT."""
+        try:
+            from datetime import datetime as _dt
+            path = os.path.join(BASE_DIR, f"optilag_export_{_dt.now().strftime('%Y%m%d_%H%M%S')}.txt")
+            lines = [
+                "=== OptiLag — Relatório ===",
+                f"Data: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"User: {getattr(self, 'username', '?')}",
+                f"Jogo: {self.jogo}",
+                f"Rota: {self.rota}",
+                f"Ping atual: {self.ping_atual} ms",
+                f"Ping real: {self.ping_real} ms",
+                f"Nível/XP: {self.cfg.get('level')}/{self.cfg.get('xp')}",
+                f"Sessões: {self.cfg.get('sessoes_count', 0)}",
+                f"Tempo total: {self._fmt_total()}",
+                f"Conquistas: {', '.join(self.cfg.get('conquistas') or [])}",
+                "",
+                "Histórico recente:",
+            ]
+            for h in (self.historico or [])[-10:]:
+                lines.append(
+                    f"  {h.get('data')} | {h.get('jogo')} | {h.get('antes')}->{h.get('depois')} ms | {h.get('duracao')}"
+                )
+            if HAS_BACKEND:
+                try:
+                    st = backend_db.stats()
+                    lines.append("")
+                    lines.append(f"Backend probes: {st.get('probes')}  avg: {st.get('avg_ping')}")
+                except Exception:
+                    pass
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            self.lbl_info.configure(text=f"Exportado: {os.path.basename(path)}")
+            self._add_xp(3, "exportou relatório")
+        except Exception as e:
+            self.lbl_info.configure(text=f"Erro export: {e}")
+
+
+    def _refresh_tunnel_ui(self):
+        try:
+            if not getattr(self, "_wg", None):
+                self.lbl_wg.configure(text="WireGuard: modulo indisponivel", text_color=COR_SEC)
+                return
+            info = self._wg.status()
+            colors = {
+                "active": "#39ff14",
+                "inactive": COR_SEC,
+                "not_installed": COR_LARANJA,
+                "error": COR_VERMELHO,
+                "unknown": COR_SEC,
+            }
+            st = info.status.value if hasattr(info.status, "value") else str(info.status)
+            self.lbl_wg.configure(
+                text=f"WireGuard: {st} — {info.detail}",
+                text_color=colors.get(st, COR_SEC),
+            )
+            if st == "active":
+                self.btn_wg.configure(text="🔐 WG ON (clique p/ off)", fg_color="#1a3d2e")
+            else:
+                self.btn_wg.configure(text="🔐 Tunnel WG", fg_color="#21262d")
+        except Exception as e:
+            print(f"[wg ui] {e}")
+
+    def _toggle_tunnel(self):
+        if not getattr(self, "_wg", None):
+            self.lbl_info.configure(text="WireGuard: instala o modulo / ve conf/README.md")
+            return
+        try:
+            info = self._wg.status()
+            st = info.status.value if hasattr(info.status, "value") else str(info.status)
+            if st == "active":
+                self.lbl_info.configure(text="A desativar tunnel...")
+                self.update_idletasks()
+                info = self._wg.down()
+            else:
+                self.lbl_info.configure(text="A ativar tunnel (pode pedir Admin)...")
+                self.update_idletasks()
+                info = self._wg.up()
+            st2 = info.status.value if hasattr(info.status, "value") else str(info.status)
+            self.lbl_info.configure(text=f"Tunnel: {st2} — {info.detail}")
+            self._refresh_tunnel_ui()
+            # re-medir ping apos mudanca de rota
+            try:
+                p = self._measure_ping()
+                if p:
+                    with self._ping_lock:
+                        self.ping_real = p
+            except Exception:
+                pass
+        except Exception as e:
+            self.lbl_info.configure(text=f"Tunnel erro: {e}")
+            self._refresh_tunnel_ui()
+
     def _fmt_total(self):
         s = int(self.cfg.get("tempo_total_seg", 0))
         h, m = divmod(s // 60, 60)
@@ -1578,6 +1926,68 @@ class OptiLagApp(ctk.CTk):
 
         refresh_lics()
 
+
+    def _open_2fa_setup(self):
+        """Ativar ou desativar 2FA (TOTP) para o utilizador atual."""
+        if not HAS_PYOTP:
+            try:
+                self.lbl_info.configure(text="Instala: pip install pyotp")
+            except Exception:
+                pass
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("OptiLag — 2FA")
+        win.geometry("420x420")
+        win.configure(fg_color=COR_FUNDO)
+        win.transient(self)
+        msg = ctk.CTkLabel(win, text="", text_color=COR_SEC, wraplength=380)
+        if self.auth.has_2fa(self.username):
+            ctk.CTkLabel(win, text="2FA está ATIVO", font=ctk.CTkFont(size=16, weight="bold"),
+                         text_color="#39ff14").pack(pady=(20, 8))
+            ctk.CTkLabel(win, text="Palavra-passe para desativar:", text_color=COR_TEXTO).pack(anchor="w", padx=30)
+            ep = ctk.CTkEntry(win, show="•", width=340, height=34, fg_color="#21262d")
+            ep.pack(pady=4)
+            msg.pack(pady=6)
+
+            def off():
+                if self.auth.disable_2fa(self.username, ep.get()):
+                    msg.configure(text="2FA desativado", text_color="#00f0ff")
+                    win.after(800, win.destroy)
+                else:
+                    msg.configure(text="Palavra-passe incorreta", text_color=COR_VERMELHO)
+
+            ctk.CTkButton(win, text="Desativar 2FA", width=340, height=36, fg_color=COR_VERMELHO,
+                          text_color="#05050a", command=off).pack(pady=10)
+        else:
+            ctk.CTkLabel(win, text="Ativar 2FA (TOTP)", font=ctk.CTkFont(size=16, weight="bold"),
+                         text_color="#00f0ff").pack(pady=(20, 8))
+            ok, secret, uri = self.auth.setup_2fa(self.username)
+            if not ok:
+                ctk.CTkLabel(win, text=str(secret), text_color=COR_VERMELHO).pack()
+                return
+            ctk.CTkLabel(win, text="1. Abre Google Authenticator / Authy", text_color=COR_TEXTO).pack(anchor="w", padx=30)
+            ctk.CTkLabel(win, text="2. Adiciona conta com esta chave:", text_color=COR_TEXTO).pack(anchor="w", padx=30)
+            se = ctk.CTkEntry(win, width=340, height=34, fg_color="#21262d")
+            se.insert(0, secret)
+            se.configure(state="readonly")
+            se.pack(pady=6)
+            ctk.CTkLabel(win, text="3. Introduz o código de 6 dígitos:", text_color=COR_TEXTO).pack(anchor="w", padx=30, pady=(8, 0))
+            ec = ctk.CTkEntry(win, width=340, height=34, fg_color="#21262d", placeholder_text="000000")
+            ec.pack(pady=4)
+            msg.pack(pady=6)
+
+            def conf():
+                if self.auth.confirm_2fa(self.username, ec.get()):
+                    msg.configure(text="2FA ativado com sucesso", text_color="#39ff14")
+                    win.after(900, win.destroy)
+                else:
+                    msg.configure(text="Código inválido — tenta outro", text_color=COR_VERMELHO)
+
+            ctk.CTkButton(win, text="Confirmar e ativar", width=340, height=36, fg_color="#00f0ff",
+                          text_color="#05050a", command=conf).pack(pady=10)
+            ctk.CTkLabel(win, text="Guarda a chave num sítio seguro.", font=ctk.CTkFont(size=11),
+                         text_color=COR_SEC).pack(pady=4)
+
     def _logout(self):
         self.auth.clear_session()
         self._save_cfg()
@@ -1638,7 +2048,7 @@ class OptiLagApp(ctk.CTk):
                         print(f"[backend start] {e}")
                 self.progress.pack_forget()
                 self.lbl_conn.pack_forget()
-                self.btn_opt.configure(state="normal", text=self.t["stop"], fg_color=COR_VERMELHO, hover_color="#e84118")
+                self.btn_opt.configure(state="normal", text=self.t["stop"], fg_color=COR_VERMELHO, hover_color="#e84118", text_color="#05050a")
                 self.lbl_status.configure(text=self.t["on"], text_color=self.accent)
                 self.lbl_before.configure(text=f"{self.t['before']}: {self.ping_antes} ms")
                 self._beep()
@@ -1667,6 +2077,11 @@ class OptiLagApp(ctk.CTk):
         if self.inicio:
             dur = int((datetime.now() - self.inicio).total_seconds())
             self.cfg["tempo_total_seg"] = self.cfg.get("tempo_total_seg", 0) + dur
+            self.cfg["sessoes_count"] = int(self.cfg.get("sessoes_count", 0)) + 1
+            gain = max(0, (self.ping_antes or 0) - (self.ping_atual or 0))
+            xp_gain = 10 + min(30, dur // 60) + min(20, gain // 5)
+            self._add_xp(xp_gain, f"sessão {dur}s")
+            self._check_session_achievements(dur, gain)
             self.historico.append({
                 "data": datetime.now().strftime("%d/%m %H:%M"), "jogo": self.jogo, "rota": self.rota,
                 "antes": self.ping_antes, "depois": self.ping_atual,
@@ -1711,7 +2126,7 @@ class OptiLagApp(ctk.CTk):
     def _open_settings(self):
         win = ctk.CTkToplevel(self)
         win.title(self.t["settings"])
-        win.geometry("380x420")
+        win.geometry("400x560")
         win.configure(fg_color=COR_FUNDO)
         win.transient(self)
         win.grab_set()
@@ -1729,6 +2144,24 @@ class OptiLagApp(ctk.CTk):
                 sw.select()
             sw.pack(side="right")
             switches[key] = sw
+
+        # --- Segurança / 2FA ---
+        sec = ctk.CTkFrame(win, fg_color=COR_CARD, corner_radius=8)
+        sec.pack(fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(sec, text="SEGURANÇA — 2FA", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=COR_SEC).pack(anchor="w", padx=12, pady=(10, 4))
+        status_2fa = "ATIVO" if self.auth.has_2fa(self.username) else "INATIVO"
+        cor_st = "#39ff14" if status_2fa == "ATIVO" else COR_SEC
+        self._lbl_2fa_status = ctk.CTkLabel(sec, text=f"Estado: {status_2fa}", font=ctk.CTkFont(size=12),
+                                           text_color=cor_st)
+        self._lbl_2fa_status.pack(anchor="w", padx=12, pady=2)
+        ctk.CTkLabel(sec, text="Usa Google Authenticator ou Authy.", font=ctk.CTkFont(size=11),
+                     text_color=COR_SEC).pack(anchor="w", padx=12, pady=(0, 6))
+        ctk.CTkButton(
+            sec, text="🔐  Ativar / gerir 2FA", height=36, fg_color="#21262d",
+            hover_color="#30363d", border_width=1, border_color=self.accent,
+            command=lambda: (win.destroy(), self._open_2fa_setup()),
+        ).pack(fill="x", padx=12, pady=(0, 12))
 
         def salvar():
             for k, sw in switches.items():
