@@ -1,39 +1,58 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec — OptiLag (Windows)
-# Build: pyinstaller OptiLag.spec
+# OptiLag — PyInstaller (Windows)
+# Build: python -m PyInstaller OptiLag.spec --noconfirm
 
-import sys
-from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
-root = Path(SPECPATH)
 
 datas = []
-icons = root / "icons"
-if icons.is_dir():
-    datas.append((str(icons), "icons"))
-conf = root / "conf"
-if conf.is_dir():
-    datas.append((str(conf), "conf"))
-
-hidden = [
+binaries = []
+hiddenimports = [
     "customtkinter",
     "PIL",
     "PIL._tkinter_finder",
+    "pyotp",
     "optilag_backend",
     "optilag_backend.network",
+    "optilag_backend.network.probes",
     "optilag_backend.routing",
+    "optilag_backend.routing.graph",
+    "optilag_backend.routing.simulator",
     "optilag_backend.core",
+    "optilag_backend.core.engine",
     "optilag_backend.tunnel",
+    "optilag_backend.tunnel.wireguard",
     "optilag_backend.bridge",
+    "optilag_backend.models",
+    "optilag_backend.persistence",
 ]
+
+# customtkinter assets
+try:
+    ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
+    datas += ctk_datas
+    binaries += ctk_binaries
+    hiddenimports += ctk_hidden
+except Exception:
+    pass
+
+# Optional folders (only if they exist — avoids bad TOC entries)
+import os
+from pathlib import Path
+
+root = Path(SPECPATH)
+for folder, dest in (("icons", "icons"), ("conf", "conf")):
+    p = root / folder
+    if p.is_dir():
+        datas.append((str(p), dest))
 
 a = Analysis(
     ["optilag_pubg.py"],
     pathex=[str(root)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
-    hiddenimports=hidden,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -43,16 +62,6 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
-
-# collect customtkinter package data
-try:
-    from PyInstaller.utils.hooks import collect_all
-    ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
-    a.datas += ctk_datas
-    a.binaries += ctk_binaries
-    a.hiddenimports += ctk_hidden
-except Exception:
-    pass
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -65,13 +74,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    console=False,  # sem consola preta
+    upx=False,
+    console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
 )
 
 coll = COLLECT(
@@ -80,7 +85,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="OptiLag",
 )
