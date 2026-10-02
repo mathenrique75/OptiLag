@@ -38,3 +38,23 @@ optilag_auth.json
 optilag_config.json
 optilag_history.json
 *.db
+# Lixo local / nao e o app
+build_log.txt
+desktop.ini
+free-games-bot/
+free-games-bot -BACKUP/
+ping3/
+optilag/
+gitignore
+lag_optimizer.txt
+pre-commit-config.yaml
+*.zip
+dist/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+optilag_auth.json
+optilag_config.json
+optilag_history.json
+*.db
