@@ -1,0 +1,48 @@
+# --- Line endings ---
+* text=auto eol=lf
+
+# Código e config em LF
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.sh text eol=lf
+
+# Windows scripts em CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Git / CI
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Binários (sem conversão de EOL)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.pyd binary
+*.db binary
+*.sqlite binary
+
+# Exports / logs
+*.log text eol=lf
+build_log.txt text eol=lf
+
+# PyInstaller
+*.spec text eol=lf
